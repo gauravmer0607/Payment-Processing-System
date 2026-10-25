@@ -1,0 +1,64 @@
+const cryptoUtil = require('../utils/crypto');
+const Order = require('../models/Order');
+const Payment = require('../models/Payment');
+const transactionLogger = require('../services/transactionLogger');
+const logger = require('../config/logger');
+
+const parseWebhookBody = (body) => {
+  if (Buffer.isBuffer(body)) return JSON.parse(body.toString('utf8'));
+  if (typeof body === 'string') return JSON.parse(body);
+  return body;
+};
+
+exports.receiveWebhook = async (req, res, next) => {
+  const signature = req.headers['x-webhook-signature'];
+  const secret = process.env.WEBHOOK_SECRET;
+
+  if (!secret) {
+    logger.error('WEBHOOK_SECRET environment variable is not configured.');
+    return res.status(500).json({ success: false, message: 'Webhook verification is not configured' });
+  }
+
+  if (!signature) {
+    logger.warn('Webhook received without signature');
+    return res.status(401).json({ success: false, message: 'Webhook signature is required' });
+  }
+
+  const isValid = cryptoUtil.verifyWebhookSignature(req.body, signature, secret);
+  if (!isValid) {
+    logger.warn('Webhook received with invalid signature');
+    return res.status(401).json({ success: false, message: 'Invalid webhook signature' });
+  }
+
+  let payload;
+  try {
+    payload = parseWebhookBody(req.body);
+  } catch (error) {
+    logger.warn(`Webhook received with invalid JSON: ${error.message}`);
+    return res.status(400).json({ success: false, message: 'Invalid webhook payload' });
+  }
+
+  const { event, paymentId, orderId } = payload;
+
+  logger.info(`Webhook received: ${event} for payment ${paymentId}`);
+
+  // Process webhook event
+  if (event === 'payment.success' || event === 'payment.failed') {
+    const payment = await Payment.findOne({ paymentId });
+    const order = await Order.findOne({ orderId });
+
+    if (payment && order) {
+      await transactionLogger.log({
+        paymentId: payment._id,
+        orderId: order._id,
+        userId: payment.userId,
+        event: 'webhook.sent',
+        status: 'info',
+        message: `Webhook processed: ${event}`,
+        metadata: { event, paymentId, orderId },
+      });
+    }
+  }
+
+  res.status(200).json({ success: true, message: 'Webhook received' });
+};
